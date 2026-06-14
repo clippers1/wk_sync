@@ -1,30 +1,29 @@
-# CLIProxyAPIPlus 原始二进制提取 GitHub Actions (v2)
+# CLIProxyAPIPlus 原始二进制提取 GitHub Actions (v3)
 #
-# 功能: 从 Docker 镜像拉取 CLIProxyAPIPlus，仅提取原始二进制并上传到 GitHub Release
+# 功能: 从 Docker 镜像拉取 CLIProxyAPIPlus，逐层查找二进制并上传到 GitHub Release
 #
 # 触发方式:
 #   - 手动触发 (workflow_dispatch)
 #   - 定时触发 (每周一 UTC 00:00)
 #   - Push 到 main 分支
-#
 
-name: Extract CLIProxyAPIPlus Binary v2
+name: Extract CLIProxyAPIPlus Binary v3
 
 on:
   workflow_dispatch:
     inputs:
       image:
-        description: 'Docker镜像地址'
+        description: 'Docker 镜像地址'
         required: false
         default: 'agassiz/cli-proxy-api-plus:latest'
   schedule:
-    - cron: '0 0 * * 1' # 每周一 UTC 00:00
+    - cron: '0 0 * * 1'
   push:
     branches:
       - main
 
 env:
-  IMAGE: ${{ github.event.inputs.image || 'agassiz/cli-proxy-api-plus:latest' }}
+  IMAGE: ${{ inputs.image || 'agassiz/cli-proxy-api-plus:latest' }}
 
 permissions:
   contents: write
@@ -40,18 +39,20 @@ jobs:
     steps:
       - name: Set release metadata
         id: meta
+        shell: bash
         run: |
-          DATE_TAG=$(date +%Y%m%d)
+          DATE_TAG=$(date -u +%Y%m%d)
           RELEASE_TAG="binary-${DATE_TAG}-${GITHUB_RUN_NUMBER}"
           RELEASE_NAME="CLIProxyAPIPlus Binary ${DATE_TAG}"
-          echo "date_tag=$DATE_TAG" >> $GITHUB_OUTPUT
-          echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
-          echo "release_name=$RELEASE_NAME" >> $GITHUB_OUTPUT
+          echo "date_tag=$DATE_TAG" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "release_name=$RELEASE_NAME" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
+        shell: bash
         run: |
           cat > release_notes.md << EOF
           CLIProxyAPIPlus 原始二进制自动提取发布
@@ -63,7 +64,7 @@ jobs:
 
           附件包含:
           - amd64 原始二进制
-          - arm64 原始二进制
+          - arm64 原始二进制，若来源镜像支持该架构
           - 对应架构的信息说明文件
           EOF
 
@@ -85,80 +86,144 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install dependencies
+        shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y skopeo file
+          sudo apt-get install -y --no-install-recommends skopeo jq file
 
-      - name: Pull Docker image with skopeo
+      - name: Pull Docker image archive
+        shell: bash
         run: |
           mkdir -p work
-          cd work
-          echo "📦 Pulling image: ${{ env.IMAGE }} (arch: ${{ matrix.arch }})"
-          skopeo copy --override-arch ${{ matrix.arch }} "docker://${{ env.IMAGE }}" "dir:."
-          echo "✅ Image pulled successfully"
+          echo "Pulling image: ${{ env.IMAGE }} (arch: ${{ matrix.arch }})"
+          skopeo copy \
+            --override-os linux \
+            --override-arch "${{ matrix.arch }}" \
+            "docker://${{ env.IMAGE }}" \
+            "docker-archive:work/image.tar"
 
-      - name: Extract binary from largest layer
+      - name: Extract binary from image layers
         id: extract
+        shell: bash
         run: |
-          cd work
-          LARGEST_BLOB=$(ls -S ./* 2>/dev/null | grep -v manifest.json | grep -v version | head -1)
-          echo "📂 Largest blob: $LARGEST_BLOB"
-          tar xf "$LARGEST_BLOB"
+          set -euo pipefail
 
-          if [ -f "CLIProxyAPI/CLIProxyAPIPlus" ]; then
-            BINARY_PATH="CLIProxyAPI/CLIProxyAPIPlus"
-          elif [ -f "CLIProxyAPIPlus" ]; then
-            BINARY_PATH="CLIProxyAPIPlus"
-          else
-            echo "❌ Binary not found"
+          IMAGE_TAR="work/image.tar"
+          TARGET_BASENAME="CLIProxyAPIPlus"
+          FALLBACK_DATE="${{ needs.prepare_release.outputs.date_tag }}"
+
+          MANIFEST_JSON="$(tar -xOf "$IMAGE_TAR" manifest.json)"
+          CONFIG_PATH="$(jq -r '.[0].Config' <<< "$MANIFEST_JSON")"
+          CONFIG_JSON="$(tar -xOf "$IMAGE_TAR" "$CONFIG_PATH")"
+
+          IMAGE_ARCH="$(jq -r '.architecture // empty' <<< "$CONFIG_JSON")"
+          IMAGE_CREATED="$(jq -r '.created // empty' <<< "$CONFIG_JSON")"
+          IMAGE_DATE="$(printf '%s' "$IMAGE_CREATED" | cut -d'T' -f1 | tr -d '-')"
+
+          if [ -z "$IMAGE_ARCH" ] || [ "$IMAGE_ARCH" = "null" ]; then
+            IMAGE_ARCH="${{ matrix.arch }}"
+          fi
+
+          if [ -z "$IMAGE_DATE" ] || [ "$IMAGE_DATE" = "null" ]; then
+            IMAGE_DATE="$FALLBACK_DATE"
+          fi
+
+          OUTPUT_NAME="CLIProxyAPIPlus_${IMAGE_DATE}_${IMAGE_ARCH}"
+          CONFIG_NAME="config.example.yaml"
+          mkdir -p work/layers extracted
+
+          mapfile -t LAYERS < <(jq -r '.[0].Layers[]' <<< "$MANIFEST_JSON")
+          if [ "${#LAYERS[@]}" -eq 0 ]; then
+            echo "No layers found in manifest.json" >&2
             exit 1
           fi
 
-          echo "✅ Found binary: $BINARY_PATH"
-          echo "binary_path=$BINARY_PATH" >> $GITHUB_OUTPUT
+          BINARY_FOUND=""
+          CONFIG_FOUND=""
 
-      - name: Prepare output files
+          for i in "${!LAYERS[@]}"; do
+            LAYER="${LAYERS[$i]}"
+            LAYER_TAR="work/layers/layer-${i}.tar"
+            tar -xOf "$IMAGE_TAR" "$LAYER" > "$LAYER_TAR"
+
+            if [ -z "$BINARY_FOUND" ]; then
+              BINARY_FOUND="$(tar -tf "$LAYER_TAR" | grep -E '(^|/)CLIProxyAPIPlus$' | head -n 1 || true)"
+              if [ -n "$BINARY_FOUND" ]; then
+                tar -xOf "$LAYER_TAR" "$BINARY_FOUND" > "extracted/$OUTPUT_NAME"
+                chmod +x "extracted/$OUTPUT_NAME"
+              fi
+            fi
+
+            if [ -z "$CONFIG_FOUND" ]; then
+              CONFIG_FOUND="$(tar -tf "$LAYER_TAR" | grep -E '(^|/)config\.example\.yaml$' | head -n 1 || true)"
+              if [ -n "$CONFIG_FOUND" ]; then
+                tar -xOf "$LAYER_TAR" "$CONFIG_FOUND" > "extracted/$CONFIG_NAME"
+              fi
+            fi
+
+            if [ -n "$BINARY_FOUND" ] && [ -n "$CONFIG_FOUND" ]; then
+              break
+            fi
+          done
+
+          if [ -z "$BINARY_FOUND" ]; then
+            echo "Binary not found: $TARGET_BASENAME" >&2
+            exit 1
+          fi
+
+          echo "binary_layer_path=$BINARY_FOUND" >> "$GITHUB_OUTPUT"
+          echo "output_name=$OUTPUT_NAME" >> "$GITHUB_OUTPUT"
+          echo "image_arch=$IMAGE_ARCH" >> "$GITHUB_OUTPUT"
+          echo "image_date=$IMAGE_DATE" >> "$GITHUB_OUTPUT"
+
+          if [ -n "$CONFIG_FOUND" ]; then
+            echo "config_layer_path=$CONFIG_FOUND" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Prepare info file
         id: output
+        shell: bash
         run: |
-          OUTPUT_NAME="CLIProxyAPIPlus_${{ needs.prepare_release.outputs.date_tag }}_${{ matrix.arch }}"
-          INFO_NAME="binary_info_${{ matrix.arch }}.txt"
-          cp "work/${{ steps.extract.outputs.binary_path }}" "$OUTPUT_NAME"
-          chmod +x "$OUTPUT_NAME"
+          OUTPUT_NAME="${{ steps.extract.outputs.output_name }}"
+          INFO_NAME="binary_info_${{ steps.extract.outputs.image_arch }}.txt"
 
           cat > "$INFO_NAME" << EOF
           CLIProxyAPIPlus Binary Information
           ================================
           Date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
           Source Image: ${{ env.IMAGE }}
-          Architecture: ${{ matrix.arch }}
+          Architecture: ${{ steps.extract.outputs.image_arch }}
+          Image Date: ${{ steps.extract.outputs.image_date }}
           Output File: $OUTPUT_NAME
-          File Type: $(file "$OUTPUT_NAME")
+          Layer Path: ${{ steps.extract.outputs.binary_layer_path }}
+          File Type: $(file "extracted/$OUTPUT_NAME")
           EOF
 
-          echo "output_name=$OUTPUT_NAME" >> $GITHUB_OUTPUT
-          echo "info_name=$INFO_NAME" >> $GITHUB_OUTPUT
+          echo "output_name=$OUTPUT_NAME" >> "$GITHUB_OUTPUT"
+          echo "info_name=$INFO_NAME" >> "$GITHUB_OUTPUT"
 
       - name: Upload binary to GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
+        shell: bash
         run: |
           gh release upload "${{ needs.prepare_release.outputs.release_tag }}" \
             --repo "$GH_REPO" \
-            "${{ steps.output.outputs.output_name }}" \
+            "extracted/${{ steps.output.outputs.output_name }}" \
             "${{ steps.output.outputs.info_name }}" \
             --clobber
 
       - name: Summary
+        shell: bash
         run: |
-          echo "## ✅ Binary Extract Complete (${{ matrix.arch }})" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Source Image | \`${{ env.IMAGE }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Architecture | ${{ matrix.arch }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Release Tag | \`${{ needs.prepare_release.outputs.release_tag }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Output | \`${{ steps.output.outputs.output_name }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "📦 Binary uploaded to GitHub Release." >> $GITHUB_STEP_SUMMARY
-
+          echo "## Binary Extract Complete (${{ steps.extract.outputs.image_arch }})" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Item | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Source Image | \`${{ env.IMAGE }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Architecture | ${{ steps.extract.outputs.image_arch }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Image Date | ${{ steps.extract.outputs.image_date }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Release Tag | \`${{ needs.prepare_release.outputs.release_tag }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Output | \`${{ steps.output.outputs.output_name }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Layer Path | \`${{ steps.extract.outputs.binary_layer_path }}\` |" >> "$GITHUB_STEP_SUMMARY"
